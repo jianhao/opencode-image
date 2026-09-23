@@ -2,11 +2,22 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
+import { fileURLToPath } from "node:url"
 import sharp from "sharp"
 import { OpenCodeImagePlugin } from "../src/index.js"
+import { ImageServer, derivePort } from "../src/server.js"
+import { isNewer } from "../src/update.js"
+import { PreviewCache } from "../src/cache.js"
+import { defaultImageDir, resolveOutDir } from "../src/options.js"
+import { execFileSync } from "node:child_process"
 
 const realFetch = globalThis.fetch
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-image-test-"))
+const cacheDir = path.join(root, "preview-cache")
+
+afterAll(() => {
+  fs.rmSync(root, { recursive: true, force: true })
+})
 
 let payload: Buffer
 
@@ -27,13 +38,31 @@ afterAll(() => {
   globalThis.fetch = realFetch
 })
 
-async function usePlugin() {
+let portSeed = 45100
+let instanceSeed = 0
+
+async function usePlugin(extra: Record<string, unknown> = {}) {
+  const seed = instanceSeed++
   const plugin = await OpenCodeImagePlugin({} as any, {
     apiKey: "test-key",
     maxSize: 1024,
     displayMaxSize: 448,
+    // 测试里显式指定端口：派生端口依赖目录哈希，跨测试目录可能相撞导致偶发失败
+    serverPort: portSeed++,
+    // 测试不打网络；显式指定 outDir 与 cacheDir，避免写进真实的全局目录
+    updateCheck: false,
+    outDir: path.join(root, "images", `g${seed}`),
+    cacheDir: path.join(cacheDir, `p${seed}`),
+    ...extra,
   } as any)
   return plugin.tool as any
+}
+
+/** displayMaxSize = 0 时没有 ?w= 参数，单独取一次 */
+function fullSizeUrl(output: string) {
+  const match = /!\[[^\]]*\]\((http:\/\/127\.0\.0\.1:\d+\/img\/[^)]+)\)/.exec(output)
+  if (!match) throw new Error(`no image url in tool output:\n${output}`)
+  return match[1]
 }
 
 function context(directory: string) {
@@ -58,7 +87,7 @@ function png(width: number, height: number) {
 }
 
 function urlFrom(output: string) {
-  const match = /\((http:\/\/127\.0\.0\.1:\d+\/img\/[0-9a-f]+\?w=\d+)\)/.exec(output)
+  const match = /\((http:\/\/127\.0\.0\.1:\d+\/img\/[A-Za-z0-9_-]+(?:\/[^)?]*)?\?w=\d+)\)/.exec(output)
   if (!match) throw new Error(`no inline image url in tool output:\n${output}`)
   return match[1]
 }
@@ -73,10 +102,11 @@ describe("image_generate", () => {
 
     expect(res.output).toContain("IMPORTANT: copy the Markdown image line")
     expect(res.attachments?.[0]?.mime).toBe("image/png")
+    // 客户端不支持图片套链接，缩略图模式下必须是「图片 + 单独链接行」
+    expect(res.output).not.toContain("[![")
+    expect(res.output).toContain("[查看原图](")
 
-    const saved = path.join(dir, ".opencode-images")
-    const file = fs.readdirSync(saved)[0]
-    const savedMeta = await sharp(path.join(saved, file)).metadata()
+    const savedMeta = await sharp(res.metadata.file).metadata()
     expect([savedMeta.width, savedMeta.height]).toEqual([1024, 1024])
 
     const res2 = await realFetch(urlFrom(res.output))
@@ -84,6 +114,22 @@ describe("image_generate", () => {
     expect(res2.headers.get("content-type")).toBe("image/png")
     const served = await sharp(Buffer.from(await res2.arrayBuffer())).metadata()
     expect([served.width, served.height]).toEqual([448, 448])
+  })
+
+  test("displayMaxSize = 0 serves the original with no extra link", async () => {
+    payload = await png(900, 900)
+    const dir = path.join(root, "full-size")
+    const tools = await usePlugin({ displayMaxSize: 0 })
+
+    const res = await tools.image_generate.execute({ prompt: "full size" }, context(dir))
+
+    expect(res.output).not.toContain("?w=")
+    expect(res.output).not.toContain("[查看原图](")
+
+    const served = await realFetch(fullSizeUrl(res.output))
+    expect(served.status).toBe(200)
+    const meta = await sharp(Buffer.from(await served.arrayBuffer())).metadata()
+    expect([meta.width, meta.height]).toEqual([900, 900])
   })
 
   test("never upscales a preview", async () => {
@@ -141,6 +187,12 @@ describe("image_edit", () => {
 })
 
 describe("image server", () => {
+  test("derives a stable port from the project directory", () => {
+    expect(derivePort("/a/b/c")).toBe(derivePort("/a/b/c"))
+    expect(derivePort("/a/b/c")).toBeGreaterThanOrEqual(41000)
+    expect(derivePort("/a/b/c")).toBeLessThan(45000)
+  })
+
   test("404s unknown ids and path traversal", async () => {
     payload = await png(500, 500)
     const dir = path.join(root, "security")
@@ -158,6 +210,44 @@ describe("image server", () => {
     expect(file.status).toBe(404)
   })
 
+  test("a fresh server keeps serving a url minted before the restart", async () => {
+    const dir = path.join(root, "restart")
+    const outDir = path.join(dir, ".opencode-images")
+    fs.mkdirSync(outDir, { recursive: true })
+    const file = path.join(outDir, "kept.png")
+    fs.writeFileSync(file, await png(300, 200))
+
+    const cache = new PreviewCache(cacheDir, 50)
+    const before = new ImageServer(0, 45200, cache)
+    await before.start({ outDir })
+    const url = before.url(file, 448)
+    before.stop()
+
+    const after = new ImageServer(0, 45200, cache)
+    await after.start({ outDir })
+    expect(after.url(file, 448)).toBe(url)
+
+    const res = await realFetch(url)
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toBe("image/png")
+    after.stop()
+  })
+
+  test("refuses to serve files outside outDir", async () => {
+    const dir = path.join(root, "containment")
+    const outDir = path.join(dir, ".opencode-images")
+    fs.mkdirSync(outDir, { recursive: true })
+    const secret = path.join(root, "secret.png")
+    fs.writeFileSync(secret, await png(64, 64))
+
+    const server = new ImageServer(0, 45201, new PreviewCache(cacheDir, 50))
+    await server.start({ outDir })
+    const escaped = Buffer.from(path.relative(outDir, secret)).toString("base64url")
+    const res = await realFetch(`${server.baseURL}/img/${escaped}`)
+    expect(res.status).toBe(404)
+    server.stop()
+  })
+
   test("reuses one port across generations", async () => {
     payload = await png(500, 500)
     const dir = path.join(root, "reuse")
@@ -168,6 +258,108 @@ describe("image server", () => {
 
     expect(new URL(urlFrom(a.output)).port).toBe(new URL(urlFrom(b.output)).port)
   })
+})
+
+describe("update check", () => {
+  test("compares versions", () => {
+    expect(isNewer("0.1.2", "0.1.1")).toBe(true)
+    expect(isNewer("0.1.1", "0.1.1")).toBe(false)
+    expect(isNewer("0.0.9", "0.1.0")).toBe(false)
+    expect(isNewer("1.0.0", "0.9.9")).toBe(true)
+    expect(isNewer("1.0.0", "1.0.0-beta")).toBe(true)
+    expect(isNewer("1.0.0-beta", "1.0.0")).toBe(false)
+  })
+
+  test("--update removes only this package's cache dirs", () => {
+    const cache = fs.mkdtempSync(path.join(root, "cli-cache-"))
+    for (const name of ["opencode-image", "opencode-image@latest", "opencode-image@0.1.0", "other-plugin"]) {
+      fs.mkdirSync(path.join(cache, name), { recursive: true })
+    }
+
+    const cli = fileURLToPath(new URL("../bin/cli.js", import.meta.url))
+    const out = execFileSync(process.execPath, [cli, "--update"], {
+      env: { ...process.env, OPENCODE_IMAGE_PLUGIN_CACHE: cache },
+      encoding: "utf8",
+    })
+
+    expect(out).toContain("已清理 3 个缓存目录")
+    expect(fs.existsSync(path.join(cache, "opencode-image"))).toBe(false)
+    expect(fs.existsSync(path.join(cache, "opencode-image@latest"))).toBe(false)
+    expect(fs.existsSync(path.join(cache, "opencode-image@0.1.0"))).toBe(false)
+    expect(fs.existsSync(path.join(cache, "other-plugin"))).toBe(true)
+  })
+})
+
+describe("output directory", () => {
+  test("defaults to the opencode data dir, not the project", () => {
+    expect(defaultImageDir({}, "/home/u")).toBe("/home/u/.local/share/opencode/opencode-image")
+    expect(defaultImageDir({ XDG_DATA_HOME: "/xdg" }, "/home/u")).toBe("/xdg/opencode/opencode-image")
+  })
+
+  test("resolves relative outDir against the project and keeps absolute paths", () => {
+    expect(resolveOutDir("/proj", undefined)).toBe(defaultImageDir())
+    expect(resolveOutDir("/proj", ".opencode-images")).toBe(path.join("/proj", ".opencode-images"))
+    expect(resolveOutDir("/proj", "/abs/dir")).toBe("/abs/dir")
+  })
+})
+
+describe("preview cache", () => {
+  test("evicts down to the limit and reports once", async () => {
+    const dir = fs.mkdtempSync(path.join(root, "lru-"))
+    const cache = new PreviewCache(path.join(dir, "cache"), 2)
+    const staging = path.join(dir, "staging")
+    fs.mkdirSync(staging, { recursive: true })
+
+    for (const name of ["a.png", "b.png", "c.png"]) {
+      const source = path.join(dir, name)
+      fs.writeFileSync(source, await png(64, 64))
+      const generated = path.join(staging, name)
+      fs.writeFileSync(generated, await png(32, 32))
+      cache.put(source, 448, generated)
+    }
+
+    expect(cache.stats().count).toBe(2)
+
+    const notice = cache.consumeNotice()
+    expect(notice).toContain("已达上限")
+    expect(notice).toContain("[请转述给用户]")
+    expect(notice).toContain("clean")
+    expect(cache.consumeNotice()).toBeUndefined() // 只提醒一次
+
+    const removed = cache.clean()
+    expect(removed.count).toBe(2)
+    expect(cache.stats().count).toBe(0)
+  })
+
+  test("reuses the same cache file for the same source and size", async () => {
+    const dir = fs.mkdtempSync(path.join(root, "reuse-cache-"))
+    const cache = new PreviewCache(path.join(dir, "cache"), 10)
+    const source = path.join(dir, "one.png")
+    fs.writeFileSync(source, await png(64, 64))
+
+    const generated = path.join(dir, "generated.png")
+    fs.writeFileSync(generated, await png(32, 32))
+    const stored = cache.put(source, 448, generated)
+
+    expect(cache.hit(source, 448)).toBe(stored)
+    expect(cache.stats().count).toBe(1)
+  })
+})
+
+test("image_cache reports and clears previews", async () => {
+  payload = await png(600, 600)
+  const dir = path.join(root, "cache-tool")
+  const tools = await usePlugin()
+
+  const generated = await tools.image_generate.execute({ prompt: "cache" }, context(dir))
+  await realFetch(urlFrom(generated.output)) // 缩略图只在客户端真正请求时才写入缓存
+
+  expect((await tools.image_cache.execute({ action: "status" }, context(dir))).output).toContain("文件数量：1")
+
+  const cleaned = await tools.image_cache.execute({ action: "clean" }, context(dir))
+  expect(cleaned.output).toContain("已清理 1 个预览文件")
+
+  expect((await tools.image_cache.execute({ action: "status" }, context(dir))).output).toContain("文件数量：0")
 })
 
 test("fails fast without an apiKey", async () => {

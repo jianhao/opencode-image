@@ -1,6 +1,6 @@
 {
   "name": "opencode-image",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Image generation and editing tools for opencode, with inline rendering in the conversation.",
   "type": "module",
   "license": "MIT",
@@ -13,6 +13,18 @@
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jianhao/opencode-image.git"
+  },
+  "homepage": "https://github.com/jianhao/opencode-image#readme",
+  "bugs": {
+    "url": "https://github.com/jianhao/opencode-image/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -21,6 +33,7 @@
   },
   "files": [
     "dist",
+    "bin",
     "README.md",
     "LICENSE"
   ],
@@ -30,7 +43,8 @@
     "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "prepublishOnly": "bun run build && bun test"
+    "prepublishOnly": "bun run build && bun test",
+    "release": "npm version patch && npm publish && rm -rf ~/.cache/opencode/packages/opencode-image*"
   },
   "engines": {
     "node": ">=18"
@@ -42,5 +56,8 @@
   "devDependencies": {
     "@types/node": "^24.12.2",
     "typescript": "^5.8.2"
+  },
+  "bin": {
+    "opencode-image": "./bin/cli.js"
   }
 }
