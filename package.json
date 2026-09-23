@@ -1,6 +1,6 @@
 {
   "name": "opencode-image",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Image generation and editing tools for opencode, with inline rendering in the conversation.",
   "type": "module",
   "license": "MIT",
