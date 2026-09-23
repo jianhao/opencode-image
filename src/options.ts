@@ -42,6 +42,8 @@ export type PluginOptions = {
   serverIdleMs?: number
   /** 首次出图时查一次 npm 最新版，落后则在工具输出末尾附升级提示。默认开启 */
   updateCheck?: boolean
+  /** 往系统提示里注入一条"用哪个工具生图"的规则。默认开启 */
+  injectPrompt?: boolean
   /** 对话里展示用的缩略图缓存目录，默认 <系统临时目录>/opencode-image */
   cacheDir?: string
   /** 缩略图缓存最多保留多少个文件，超出按最久未访问淘汰；0 表示不限制 */
@@ -70,6 +72,7 @@ export type ResolvedOptions = {
   serverPort: number
   serverIdleMs: number
   updateCheck: boolean
+  injectPrompt: boolean
   cacheDir: string
   cacheLimit: number
   timeoutMs: number
@@ -94,6 +97,7 @@ export function resolveOptions(options: PluginOptions | undefined): ResolvedOpti
     serverPort: opts.serverPort ?? DEFAULT_SERVER_PORT,
     serverIdleMs: opts.serverIdleMs ?? DEFAULT_SERVER_IDLE_MS,
     updateCheck: opts.updateCheck ?? true,
+    injectPrompt: opts.injectPrompt ?? true,
     cacheDir: opts.cacheDir ?? DEFAULT_CACHE_DIR,
     cacheLimit: opts.cacheLimit ?? DEFAULT_CACHE_LIMIT,
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,

@@ -41,9 +41,9 @@ afterAll(() => {
 let portSeed = 45100
 let instanceSeed = 0
 
-async function usePlugin(extra: Record<string, unknown> = {}) {
+async function useHooks(extra: Record<string, unknown> = {}) {
   const seed = instanceSeed++
-  const plugin = await OpenCodeImagePlugin({} as any, {
+  return OpenCodeImagePlugin({} as any, {
     apiKey: "test-key",
     maxSize: 1024,
     displayMaxSize: 448,
@@ -55,7 +55,10 @@ async function usePlugin(extra: Record<string, unknown> = {}) {
     cacheDir: path.join(cacheDir, `p${seed}`),
     ...extra,
   } as any)
-  return plugin.tool as any
+}
+
+async function usePlugin(extra: Record<string, unknown> = {}) {
+  return (await useHooks(extra)).tool as any
 }
 
 /** displayMaxSize = 0 时没有 ?w= 参数，单独取一次 */
@@ -300,6 +303,22 @@ describe("output directory", () => {
     expect(resolveOutDir("/proj", undefined)).toBe(defaultImageDir())
     expect(resolveOutDir("/proj", ".opencode-images")).toBe(path.join("/proj", ".opencode-images"))
     expect(resolveOutDir("/proj", "/abs/dir")).toBe("/abs/dir")
+  })
+})
+
+describe("system prompt rule", () => {
+  test("injects the tool guidance by default", async () => {
+    const hooks = await useHooks()
+    const output = { system: [] as string[] }
+    await hooks["experimental.chat.system.transform"]!({} as any, output)
+    expect(output.system.join("\n")).toContain("image_generate")
+  })
+
+  test("can be turned off", async () => {
+    const hooks = await useHooks({ injectPrompt: false })
+    const output = { system: [] as string[] }
+    await hooks["experimental.chat.system.transform"]!({} as any, output)
+    expect(output.system).toEqual([])
   })
 })
 

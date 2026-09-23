@@ -124,10 +124,13 @@ export const OpenCodeImagePlugin: Plugin = async (_input, rawOptions) => {
     tool: {
       image_generate: tool({
         description:
-          "Generate a new image from a text prompt using an OpenAI-compatible image API. " +
-          "The result starts with a Markdown image line (plus a separate 查看原图 link when displayMaxSize is set) that you MUST copy verbatim into your reply text, " +
-          "If the output contains a line starting with [请转述给用户], relay that line to the user in your reply. " +
-          "otherwise the user cannot see the picture. To iterate on a result, call image_edit with the returned path.",
+          "Generate an image from a text prompt. This is the only supported way to create images in this session: " +
+          "the endpoint and API key are already configured inside this plugin, so NEVER call the image API yourself " +
+          "(no curl, no scripts) and never read the API key out of opencode.json. " +
+          "The first line of the output is a Markdown image line (plus a separate 查看原图 link when displayMaxSize > 0); " +
+          "you MUST copy those lines verbatim into your reply text, otherwise the user cannot see the picture. " +
+          "If the output contains a line starting with [请转述给用户], relay that line to the user as well. " +
+          "To refine a result, call image_edit with the returned path instead of generating a new image.",
         args: {
           prompt: z.string().describe("Detailed description of the image to generate"),
           filename: z.string().optional().describe("Optional output file name or path; defaults to a timestamped name"),
@@ -136,11 +139,12 @@ export const OpenCodeImagePlugin: Plugin = async (_input, rawOptions) => {
       }),
       image_edit: tool({
         description:
-          "Edit an existing image with a text instruction (image-to-image). Pass the exact path returned by a previous " +
-          "image_generate or image_edit call to keep refining the same picture. " +
-          "The result starts with a Markdown image line (plus a separate 查看原图 link when displayMaxSize is set) that you MUST copy verbatim into your reply text, " +
-          "If the output contains a line starting with [请转述给用户], relay that line to the user in your reply. " +
-          "otherwise the user cannot see the picture.",
+          "Edit an existing image with a text instruction (image-to-image). Prefer this over generating a new image " +
+          "when the user wants to adjust a picture: pass the exact path returned by a previous image_generate or " +
+          "image_edit call to keep refining the same one. " +
+          "Same rules: never call the image API yourself and never read the API key; copy the Markdown image line " +
+          "(and the 查看原图 link, if present) from the output verbatim into your reply, and relay any line starting " +
+          "with [请转述给用户].",
         args: {
           image: z.string().describe("Path to the source image, normally the file returned by image_generate/image_edit"),
           prompt: z.string().describe("What to change, e.g. 'make the hat red, keep everything else identical'"),
@@ -184,6 +188,19 @@ export const OpenCodeImagePlugin: Plugin = async (_input, rawOptions) => {
           }
         },
       }),
+    },
+    /**
+     * 让模型稳定地走我们的工具：工具描述只在模型真去看工具时才有用，
+     * 这里往系统提示里加一条，避免它跑去用 imagegen skill 或自己 curl 调接口。
+     */
+    "experimental.chat.system.transform": async (_input, output) => {
+      if (!options.injectPrompt) return
+      output.system.push(
+        "Image generation/editing: always use the `image_generate` / `image_edit` tools provided by the " +
+          "opencode-image plugin — the endpoint and API key are already configured there. Never call the image API " +
+          "directly, never read the API key from config, and do not use the imagegen skill or its CLI. Copy the " +
+          "Markdown image line from that tool's output verbatim into your reply so the user can see the picture.",
+      )
     },
     dispose: async () => {
       server.stop()
