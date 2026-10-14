@@ -41,24 +41,69 @@ afterAll(() => {
 let portSeed = 45100
 let instanceSeed = 0
 
-async function useHooks(extra: Record<string, unknown> = {}) {
+/** Minimal stand-in for the v2 plugin setup context (tool + session + location + options). */
+async function setup(extra: Record<string, unknown> = {}) {
   const seed = instanceSeed++
-  return OpenCodeImagePlugin({} as any, {
-    apiKey: "test-key",
-    maxSize: 1024,
-    displayMaxSize: 448,
-    // 测试里显式指定端口：派生端口依赖目录哈希，跨测试目录可能相撞导致偶发失败
-    serverPort: portSeed++,
-    // 测试不打网络；显式指定 outDir 与 cacheDir，避免写进真实的全局目录
-    updateCheck: false,
-    outDir: path.join(root, "images", `g${seed}`),
-    cacheDir: path.join(cacheDir, `p${seed}`),
-    ...extra,
-  } as any)
+  const directory = path.join(root, "project", `p${seed}`)
+  const tools = new Map<string, any>()
+  const systemHooks: Array<(event: any) => void> = []
+  const cleanups: Array<() => unknown> = []
+
+  const ctx = {
+    location: { directory },
+    options: {
+      apiKey: "test-key",
+      maxSize: 1024,
+      displayMaxSize: 448,
+      // 测试里显式指定端口：派生端口依赖目录哈希，跨测试目录可能相撞导致偶发失败
+      serverPort: portSeed++,
+      // 测试不打网络；显式指定 outDir 与 cacheDir，避免写进真实的全局目录
+      updateCheck: false,
+      outDir: path.join(root, "images", `g${seed}`),
+      cacheDir: path.join(cacheDir, `p${seed}`),
+      ...extra,
+    },
+    tool: {
+      transform: async (fn: (editor: any) => void) => {
+        fn({
+          add: (tool: any) => tools.set(tool.name, tool),
+          list: () => [...tools.values()],
+          get: (name: string) => tools.get(name),
+          remove: (name: string) => tools.delete(name),
+        })
+      },
+    },
+    session: {
+      hook: async (name: string, fn: (event: any) => void) => {
+        if (name === "context") systemHooks.push(fn)
+      },
+    },
+  }
+
+  const cleanup = await OpenCodeImagePlugin.setup(ctx as any)
+  if (typeof cleanup === "function") cleanups.push(cleanup)
+
+  return { tools, systemHooks, directory, cleanup: () => Promise.all(cleanups.map((fn) => fn())) }
 }
 
-async function usePlugin(extra: Record<string, unknown> = {}) {
-  return (await useHooks(extra)).tool as any
+function toolContext() {
+  return {
+    sessionID: "s",
+    messageID: "m",
+    agent: "test",
+    id: "call",
+    signal: new AbortController().signal,
+    progress: async () => {},
+  } as any
+}
+
+/** Tool result text (v2 returns content as a string or a Content[] list). */
+function text(res: any) {
+  return typeof res.content === "string" ? res.content : res.content.find((item: any) => item.type === "text").text
+}
+
+function attachment(res: any) {
+  return typeof res.content === "string" ? undefined : res.content.find((item: any) => item.type === "file")
 }
 
 /** displayMaxSize = 0 时没有 ?w= 参数，单独取一次 */
@@ -66,19 +111,6 @@ function fullSizeUrl(output: string) {
   const match = /!\[[^\]]*\]\((http:\/\/127\.0\.0\.1:\d+\/img\/[^)]+)\)/.exec(output)
   if (!match) throw new Error(`no image url in tool output:\n${output}`)
   return match[1]
-}
-
-function context(directory: string) {
-  return {
-    sessionID: "s",
-    messageID: "m",
-    agent: "test",
-    directory,
-    worktree: directory,
-    abort: new AbortController().signal,
-    metadata: () => {},
-    ask: async () => {},
-  } as any
 }
 
 function png(width: number, height: number) {
@@ -98,94 +130,113 @@ function urlFrom(output: string) {
 describe("image_generate", () => {
   test("saves the full-size image and serves a downscaled preview", async () => {
     payload = await png(1600, 1600)
-    const dir = path.join(root, "generate")
-    const tools = await usePlugin()
+    const { tools, cleanup } = await setup()
+    try {
+      const res = await tools.get("image_generate").execute({ prompt: "a red square" }, toolContext())
+      const output = text(res)
 
-    const res = await tools.image_generate.execute({ prompt: "a red square" }, context(dir))
+      expect(output).toContain("IMPORTANT: copy the Markdown image line")
+      expect(attachment(res)?.mime).toBe("image/png")
+      // 客户端不支持图片套链接，缩略图模式下必须是「图片 + 单独链接行」
+      expect(output).not.toContain("[![")
+      expect(output).toContain("[查看原图](")
 
-    expect(res.output).toContain("IMPORTANT: copy the Markdown image line")
-    expect(res.attachments?.[0]?.mime).toBe("image/png")
-    // 客户端不支持图片套链接，缩略图模式下必须是「图片 + 单独链接行」
-    expect(res.output).not.toContain("[![")
-    expect(res.output).toContain("[查看原图](")
+      const savedMeta = await sharp(res.metadata.file).metadata()
+      expect([savedMeta.width, savedMeta.height]).toEqual([1024, 1024])
 
-    const savedMeta = await sharp(res.metadata.file).metadata()
-    expect([savedMeta.width, savedMeta.height]).toEqual([1024, 1024])
-
-    const res2 = await realFetch(urlFrom(res.output))
-    expect(res2.status).toBe(200)
-    expect(res2.headers.get("content-type")).toBe("image/png")
-    const served = await sharp(Buffer.from(await res2.arrayBuffer())).metadata()
-    expect([served.width, served.height]).toEqual([448, 448])
+      const res2 = await realFetch(urlFrom(output))
+      expect(res2.status).toBe(200)
+      expect(res2.headers.get("content-type")).toBe("image/png")
+      const served = await sharp(Buffer.from(await res2.arrayBuffer())).metadata()
+      expect([served.width, served.height]).toEqual([448, 448])
+    } finally {
+      await cleanup()
+    }
   })
 
   test("displayMaxSize = 0 serves the original with no extra link", async () => {
     payload = await png(900, 900)
-    const dir = path.join(root, "full-size")
-    const tools = await usePlugin({ displayMaxSize: 0 })
+    const { tools, cleanup } = await setup({ displayMaxSize: 0 })
+    try {
+      const res = await tools.get("image_generate").execute({ prompt: "full size" }, toolContext())
+      const output = text(res)
 
-    const res = await tools.image_generate.execute({ prompt: "full size" }, context(dir))
+      expect(output).not.toContain("?w=")
+      expect(output).not.toContain("[查看原图](")
 
-    expect(res.output).not.toContain("?w=")
-    expect(res.output).not.toContain("[查看原图](")
-
-    const served = await realFetch(fullSizeUrl(res.output))
-    expect(served.status).toBe(200)
-    const meta = await sharp(Buffer.from(await served.arrayBuffer())).metadata()
-    expect([meta.width, meta.height]).toEqual([900, 900])
+      const served = await realFetch(fullSizeUrl(output))
+      expect(served.status).toBe(200)
+      const meta = await sharp(Buffer.from(await served.arrayBuffer())).metadata()
+      expect([meta.width, meta.height]).toEqual([900, 900])
+    } finally {
+      await cleanup()
+    }
   })
 
   test("never upscales a preview", async () => {
     payload = await png(200, 160)
-    const dir = path.join(root, "small")
-    const tools = await usePlugin()
-
-    const res = await tools.image_generate.execute({ prompt: "tiny" }, context(dir))
-
-    const served = await realFetch(urlFrom(res.output))
-    const meta = await sharp(Buffer.from(await served.arrayBuffer())).metadata()
-    expect([meta.width, meta.height]).toEqual([200, 160])
+    const { tools, cleanup } = await setup()
+    try {
+      const res = await tools.get("image_generate").execute({ prompt: "tiny" }, toolContext())
+      const served = await realFetch(urlFrom(text(res)))
+      const meta = await sharp(Buffer.from(await served.arrayBuffer())).metadata()
+      expect([meta.width, meta.height]).toEqual([200, 160])
+    } finally {
+      await cleanup()
+    }
   })
 
   test("respects an explicit filename", async () => {
     payload = await png(600, 600)
-    const dir = path.join(root, "named")
-    const tools = await usePlugin()
+    const { tools, directory, cleanup } = await setup()
+    try {
+      const target = path.join(directory, "custom.png")
+      await tools.get("image_generate").execute({ prompt: "named", filename: target }, toolContext())
 
-    const target = path.join(dir, "custom.png")
-    await tools.image_generate.execute({ prompt: "named", filename: target }, context(dir))
-
-    expect(fs.existsSync(target)).toBe(true)
-    expect(fs.existsSync(`${target}.download`)).toBe(false)
+      expect(fs.existsSync(target)).toBe(true)
+      expect(fs.existsSync(`${target}.download`)).toBe(false)
+    } finally {
+      await cleanup()
+    }
   })
 })
 
 describe("image_edit", () => {
   test("normalizes a jpeg source to a png result", async () => {
     payload = await png(800, 800)
-    const dir = path.join(root, "edit")
-    fs.mkdirSync(dir, { recursive: true })
-    const source = path.join(dir, "source.jpg")
-    fs.writeFileSync(source, await sharp({ create: { width: 300, height: 300, channels: 3, background: "#0af" } }).jpeg().toBuffer())
+    const { tools, directory, cleanup } = await setup()
+    try {
+      fs.mkdirSync(directory, { recursive: true })
+      const source = path.join(directory, "source.jpg")
+      fs.writeFileSync(
+        source,
+        await sharp({ create: { width: 300, height: 300, channels: 3, background: "#0af" } }).jpeg().toBuffer(),
+      )
 
-    const tools = await usePlugin()
-    const res = await tools.image_edit.execute(
-      { image: source, prompt: "make it blue", filename: path.join(dir, "edited.png") },
-      context(dir),
-    )
+      const res = await tools.get("image_edit").execute(
+        { image: source, prompt: "make it blue", filename: path.join(directory, "edited.png") },
+        toolContext(),
+      )
 
-    const out = path.join(dir, "edited.png")
-    const bytes = fs.readFileSync(out)
-    expect([...bytes.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47])
-    expect(await sharp(out).metadata()).toMatchObject({ format: "png", width: 800 })
-    expect(res.output).toContain("Image edited")
+      const out = path.join(directory, "edited.png")
+      const bytes = fs.readFileSync(out)
+      expect([...bytes.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47])
+      expect(await sharp(out).metadata()).toMatchObject({ format: "png", width: 800 })
+      expect(text(res)).toContain("Image edited")
+    } finally {
+      await cleanup()
+    }
   })
 
   test("rejects a missing source", async () => {
-    const tools = await usePlugin()
-    await expect(
-      tools.image_edit.execute({ image: "/nope/missing.png", prompt: "x" }, context(root)),
-    ).rejects.toThrow("source image not found")
+    const { tools, cleanup } = await setup()
+    try {
+      await expect(
+        tools.get("image_edit").execute({ image: "/nope/missing.png", prompt: "x" }, toolContext()),
+      ).rejects.toThrow("source image not found")
+    } finally {
+      await cleanup()
+    }
   })
 })
 
@@ -198,19 +249,22 @@ describe("image server", () => {
 
   test("404s unknown ids and path traversal", async () => {
     payload = await png(500, 500)
-    const dir = path.join(root, "security")
-    const tools = await usePlugin()
-    const res = await tools.image_generate.execute({ prompt: "security" }, context(dir))
+    const { tools, cleanup } = await setup()
+    try {
+      const res = await tools.get("image_generate").execute({ prompt: "security" }, toolContext())
+      const url = new URL(urlFrom(text(res)))
 
-    const url = new URL(urlFrom(res.output))
-    const unknown = await realFetch(new URL("/img/deadbeefdeadbeef", url).toString())
-    expect(unknown.status).toBe(404)
+      const unknown = await realFetch(new URL("/img/deadbeefdeadbeef", url).toString())
+      expect(unknown.status).toBe(404)
 
-    const traversal = await realFetch(new URL("/img/..%2f..%2f..%2fetc%2fpasswd", url).toString())
-    expect(traversal.status).toBe(404)
+      const traversal = await realFetch(new URL("/img/..%2f..%2f..%2fetc%2fpasswd", url).toString())
+      expect(traversal.status).toBe(404)
 
-    const file = await realFetch(new URL("/img/", url).toString())
-    expect(file.status).toBe(404)
+      const file = await realFetch(new URL("/img/", url).toString())
+      expect(file.status).toBe(404)
+    } finally {
+      await cleanup()
+    }
   })
 
   test("a fresh server keeps serving a url minted before the restart", async () => {
@@ -253,13 +307,15 @@ describe("image server", () => {
 
   test("reuses one port across generations", async () => {
     payload = await png(500, 500)
-    const dir = path.join(root, "reuse")
-    const tools = await usePlugin()
+    const { tools, cleanup } = await setup()
+    try {
+      const a = await tools.get("image_generate").execute({ prompt: "a" }, toolContext())
+      const b = await tools.get("image_generate").execute({ prompt: "b" }, toolContext())
 
-    const a = await tools.image_generate.execute({ prompt: "a" }, context(dir))
-    const b = await tools.image_generate.execute({ prompt: "b" }, context(dir))
-
-    expect(new URL(urlFrom(a.output)).port).toBe(new URL(urlFrom(b.output)).port)
+      expect(new URL(urlFrom(text(a))).port).toBe(new URL(urlFrom(text(b))).port)
+    } finally {
+      await cleanup()
+    }
   })
 })
 
@@ -308,17 +364,24 @@ describe("output directory", () => {
 
 describe("system prompt rule", () => {
   test("injects the tool guidance by default", async () => {
-    const hooks = await useHooks()
-    const output = { system: [] as string[] }
-    await hooks["experimental.chat.system.transform"]!({} as any, output)
-    expect(output.system.join("\n")).toContain("image_generate")
+    const { systemHooks, cleanup } = await setup()
+    try {
+      expect(systemHooks.length).toBe(1)
+      const event = { system: [] as Array<{ type: "text"; text: string }> }
+      systemHooks[0]!(event)
+      expect(event.system.map((part) => part.text).join("\n")).toContain("image_generate")
+    } finally {
+      await cleanup()
+    }
   })
 
   test("can be turned off", async () => {
-    const hooks = await useHooks({ injectPrompt: false })
-    const output = { system: [] as string[] }
-    await hooks["experimental.chat.system.transform"]!({} as any, output)
-    expect(output.system).toEqual([])
+    const { systemHooks, cleanup } = await setup({ injectPrompt: false })
+    try {
+      expect(systemHooks.length).toBe(0)
+    } finally {
+      await cleanup()
+    }
   })
 })
 
@@ -367,23 +430,34 @@ describe("preview cache", () => {
 
 test("image_cache reports and clears previews", async () => {
   payload = await png(600, 600)
-  const dir = path.join(root, "cache-tool")
-  const tools = await usePlugin()
+  const { tools, cleanup } = await setup()
+  try {
+    const generated = await tools.get("image_generate").execute({ prompt: "cache" }, toolContext())
+    await realFetch(urlFrom(text(generated))) // 缩略图只在客户端真正请求时才写入缓存
 
-  const generated = await tools.image_generate.execute({ prompt: "cache" }, context(dir))
-  await realFetch(urlFrom(generated.output)) // 缩略图只在客户端真正请求时才写入缓存
+    expect(text(await tools.get("image_cache").execute({ action: "status" }, toolContext()))).toContain("文件数量：1")
 
-  expect((await tools.image_cache.execute({ action: "status" }, context(dir))).output).toContain("文件数量：1")
+    const cleaned = await tools.get("image_cache").execute({ action: "clean" }, toolContext())
+    expect(text(cleaned)).toContain("已清理 1 个预览文件")
 
-  const cleaned = await tools.image_cache.execute({ action: "clean" }, context(dir))
-  expect(cleaned.output).toContain("已清理 1 个预览文件")
-
-  expect((await tools.image_cache.execute({ action: "status" }, context(dir))).output).toContain("文件数量：0")
+    expect(text(await tools.get("image_cache").execute({ action: "status" }, toolContext()))).toContain("文件数量：0")
+  } finally {
+    await cleanup()
+  }
 })
 
 test("fails fast without an apiKey", async () => {
   const previous = process.env.PI_IMAGE_API_KEY
   delete process.env.PI_IMAGE_API_KEY
-  expect(OpenCodeImagePlugin({} as any, {} as any)).rejects.toThrow("missing apiKey")
-  if (previous) process.env.PI_IMAGE_API_KEY = previous
+  const ctx = {
+    location: { directory: root },
+    options: {},
+    tool: { transform: async () => {} },
+    session: { hook: async () => {} },
+  }
+  try {
+    await expect(OpenCodeImagePlugin.setup(ctx as any)).rejects.toThrow("missing apiKey")
+  } finally {
+    if (previous) process.env.PI_IMAGE_API_KEY = previous
+  }
 })
